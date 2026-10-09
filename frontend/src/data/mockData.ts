@@ -55,6 +55,62 @@ export const DEPARTMENTS: Record<string, Department> = {
       hi: ['मौजूदा राशन कार्ड की प्रति', 'आवेदक का आधार कार्ड', 'दुरुस्ती का प्रमाण (जन्म / विवाह प्रमाण पत्र)', 'पते का प्रमाण (बिजली बिल / कर रसीद)', 'पासपोर्ट साइज फोटो'],
       en: ['Copy of existing ration card', 'Aadhaar card of applicant', 'Proof of correct details (Birth/Marriage cert)', 'Address proof (Electricity bill)', 'Passport size photograph']
     }
+  },
+  water_supply: {
+    key: 'water_supply',
+    name: {
+      mr: 'पुणे महानगरपालिका पाणी पुरवठा विभाग',
+      hi: 'पुणे नगर निगम जल आपूर्ति विभाग',
+      en: 'PMC Water Supply Department'
+    },
+    office: 'Water Works Dept, Parvati Water Works, Pune',
+    docs: {
+      mr: ['बाधित परिसराचा अचूक पत्ता', 'समस्येचे स्वरूप (कमी दाब / दूषित पाणी / गळती)', 'पाईपलाईन गळतीचा फोटो (ऐच्छिक)'],
+      hi: ['प्रभावित क्षेत्र का सटीक पता', 'समस्या का प्रकार (कम दबाव / लीकेज / गंदा पानी)', 'पाइप लीकेज का फोटो (वैकल्पिक)'],
+      en: ['Affected location address', 'Nature of issue (Low pressure / Leakage / Contamination)', 'Photo of pipe leak (Optional)']
+    }
+  },
+  electrical_dept: {
+    key: 'electrical_dept',
+    name: {
+      mr: 'पुणे महानगरपालिका विद्युत व पथदिवे विभाग',
+      hi: 'पुणे नगर निगम विद्युत एवं स्ट्रीटलाइट विभाग',
+      en: 'PMC Electrical & Streetlight Department'
+    },
+    office: 'Electrical Dept, PMC Main Building, Shivajinagar, Pune',
+    docs: {
+      mr: ['रस्त्याचे नाव व जवळचा विजेचा खांब क्रमांक / खूण', 'परिसराचा पत्ता', 'दिव्याचा फोटो (ऐच्छिक)'],
+      hi: ['सड़क का नाम व नजदीकी खंभा नंबर / लैंडमार्क', 'स्थान का पता', 'लाइट का फोटो (वैकल्पिक)'],
+      en: ['Street name & nearby lamp pole number / landmark', 'Area address', 'Photo of streetlight (Optional)']
+    }
+  },
+  pmc_drainage: {
+    key: 'pmc_drainage',
+    name: {
+      mr: 'पुणे महानगरपालिका मलनिस्सारण व ड्रेनेज विभाग',
+      hi: 'पुणे नगर निगम जल निकासी एवं सीवेज विभाग',
+      en: 'PMC Drainage & Sewage Department'
+    },
+    office: 'Drainage Dept, PMC Annex Building, Shivajinagar, Pune',
+    docs: {
+      mr: ['तुंबलेल्या गटाराचे / चेंबरचे अचूक ठिकाण', 'जवळची खूण (लँडमार्क)', 'तुंबलेल्या सांडपाण्याचा फोटो (ऐच्छिक)'],
+      hi: ['ओवरफ्लो चेंबर का सटीक स्थान', 'नजदीकी लैंडमार्क', 'चेंबर ओवरफ्लो का फोटो (वैकल्पिक)'],
+      en: ['Location of overflowing manhole or choked drain', 'Nearby landmark', 'Photo of sewage overflow (Optional)']
+    }
+  },
+  general_admin: {
+    key: 'general_admin',
+    name: {
+      mr: 'पुणे महानगरपालिका सामान्य जनतक्रार निवारण कक्ष',
+      hi: 'पुणे नगर निगम सामान्य जनशिकायत निवारण प्रकोष्ठ',
+      en: 'PMC General Grievance Redressal Cell'
+    },
+    office: 'Citizen Facilitation Centre (CFC), PMC Main Building, Pune',
+    docs: {
+      mr: ['समस्येचे सविस्तर वर्णन', 'परिसराचा अचूक पत्ता'],
+      hi: ['समस्या का विस्तृत विवरण', 'स्थान का पता'],
+      en: ['Detailed description of issue', 'Location address']
+    }
   }
 };
 

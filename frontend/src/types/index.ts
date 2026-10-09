@@ -1,6 +1,6 @@
 export type Language = 'mr' | 'hi' | 'en';
 
-export type ComplaintCategory = 'pothole' | 'garbage' | 'ration_card' | 'other';
+export type ComplaintCategory = 'pothole' | 'garbage' | 'water' | 'streetlight' | 'drainage' | 'ration_card' | 'other';
 
 export type ComplaintStatus = 'submitted' | 'in_review' | 'in_progress' | 'resolved' | 'rejected';
 

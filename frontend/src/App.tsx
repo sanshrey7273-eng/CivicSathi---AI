@@ -1,12 +1,22 @@
 import { useState, useEffect, useRef } from 'react';
 import type { Language, ComplaintCategory, Complaint, WardStat, Scheme } from './types';
-import { PUNE_WARDS, GOV_SCHEMES } from './data/mockData';
-import { classifyText, resolveGeo, submitComplaint, fetchStats, fetchRecentComplaints, checkBackendHealth } from './lib/api';
+import { PUNE_WARDS, GOV_SCHEMES, INITIAL_WARD_STATS } from './data/mockData';
+import { classifyText, resolveGeo, submitComplaint, fetchStats, fetchRecentComplaints, checkBackendHealth, type ClassifyResult } from './lib/api';
 import { BlurText } from './components/BlurText';
 import { SpotlightCard } from './components/SpotlightCard';
 import { CountUp } from './components/CountUp';
 import { FadeContent } from './components/FadeContent';
 import { HeroBackground } from './components/HeroBackground';
+import { LocationMap } from './components/LocationMap';
+import { WardMap } from './components/WardMap';
+import { SparkleCursor } from './components/SparkleCursor';
+import { MistyPuneBackground } from './components/MistyPuneBackground';
+import { sanitizeIndianMobileInput, isValidIndianMobile, getPhoneErrorMessage } from './lib/phoneValidation';
+
+function safeNum(val: any, fallback = 0): number {
+  const n = Number(val);
+  return typeof n === 'number' && !isNaN(n) && isFinite(n) ? n : fallback;
+}
 
 export function App() {
   const [lang, setLang] = useState<Language>('mr');
@@ -15,6 +25,7 @@ export function App() {
 
   // Form State
   const [transcript, setTranscript] = useState<string>('');
+  const [interimTranscript, setInterimTranscript] = useState<string>('');
   const [isRecording, setIsRecording] = useState<boolean>(false);
   const [, setSpeechSupported] = useState<boolean>(true);
   const [speechError, setSpeechError] = useState<string | null>(null);
@@ -26,6 +37,14 @@ export function App() {
   const [citizenName, setCitizenName] = useState<string>('');
   const [citizenPhone, setCitizenPhone] = useState<string>('');
   const [formErrors, setFormErrors] = useState<Record<string, string>>({});
+  const [gpsError, setGpsError] = useState<string | null>(null);
+  const [isGpsLoading, setIsGpsLoading] = useState<boolean>(false);
+
+  // AI Classification & Department Recommendation State
+  const [classificationResult, setClassificationResult] = useState<ClassifyResult | null>(null);
+  const [isClassifying, setIsClassifying] = useState<boolean>(false);
+  const [classifyError, setClassifyError] = useState<string | null>(null);
+  const [checkedDocs, setCheckedDocs] = useState<Record<string, boolean>>({});
 
   // Submission & Result State
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
@@ -35,10 +54,11 @@ export function App() {
 
   // Dashboard & Stats State
   const [wardStats, setWardStats] = useState<WardStat[]>([]);
+  const [isLoadingStats, setIsLoadingStats] = useState<boolean>(true);
+  const [statsError, setStatsError] = useState<string | null>(null);
   const [recentComplaints, setRecentComplaints] = useState<Complaint[]>([]);
   const [selectedFilterWard, setSelectedFilterWard] = useState<string>('all');
   const [selectedFilterCategory, setSelectedFilterCategory] = useState<string>('all');
-  const [mapHoveredWard, setMapHoveredWard] = useState<string | null>(null);
 
   // Scheme Quiz State
   const [schemeAge, setSchemeAge] = useState<string>('');
@@ -52,10 +72,34 @@ export function App() {
 
   const recognitionRef = useRef<any>(null);
 
+  // Fetch ward stats with robust error handling
+  const loadDashboardStats = async () => {
+    setIsLoadingStats(true);
+    setStatsError(null);
+    try {
+      const data = await fetchStats();
+      if (data && Array.isArray(data.wards) && data.wards.length > 0) {
+        setWardStats(data.wards);
+      } else {
+        setWardStats(INITIAL_WARD_STATS);
+      }
+    } catch (e) {
+      console.error(e);
+      setStatsError(lang === 'mr' ? 'प्रभाग आकडेवारी लोड करताना त्रुटी आली.' : 'Failed to load ward statistics.');
+      setWardStats(INITIAL_WARD_STATS);
+    } finally {
+      setIsLoadingStats(false);
+    }
+  };
+
+  const handleSelectWard = (wardId: number) => {
+    setSelectedFilterWard(prev => prev === String(wardId) ? 'all' : String(wardId));
+  };
+
   // Check health and load initial data
   useEffect(() => {
     checkBackendHealth().then(setBackendOnline);
-    fetchStats().then(data => setWardStats(data.wards));
+    loadDashboardStats();
     fetchRecentComplaints().then(setRecentComplaints);
   }, []);
 
@@ -68,17 +112,42 @@ export function App() {
     }
 
     try {
+      // Clean up existing recognition handlers if any
+      if (recognitionRef.current) {
+        recognitionRef.current.onresult = null;
+        recognitionRef.current.onerror = null;
+        recognitionRef.current.onend = null;
+        recognitionRef.current.onstart = null;
+      }
+
       const recognition = new SpeechRecognition();
       recognition.continuous = true;
       recognition.interimResults = true;
       recognition.lang = lang === 'en' ? 'en-IN' : lang === 'hi' ? 'hi-IN' : 'mr-IN';
 
+      recognition.onstart = () => {
+        setInterimTranscript('');
+      };
+
       recognition.onresult = (event: any) => {
-        let currentTranscript = '';
+        let currentInterim = '';
+        let currentFinal = '';
+
         for (let i = event.resultIndex; i < event.results.length; ++i) {
-          currentTranscript += event.results[i][0].transcript;
+          if (event.results[i].isFinal) {
+            currentFinal += event.results[i][0].transcript;
+          } else {
+            currentInterim += event.results[i][0].transcript;
+          }
         }
-        setTranscript(prev => (prev ? prev + ' ' + currentTranscript : currentTranscript));
+
+        if (currentFinal) {
+          setTranscript(prev => {
+            const base = prev.trim();
+            return base ? base + ' ' + currentFinal : currentFinal;
+          });
+        }
+        setInterimTranscript(currentInterim);
       };
 
       recognition.onerror = (event: any) => {
@@ -91,12 +160,22 @@ export function App() {
 
       recognition.onend = () => {
         setIsRecording(false);
+        setInterimTranscript('');
       };
 
       recognitionRef.current = recognition;
     } catch (e) {
       setSpeechSupported(false);
     }
+    
+    return () => {
+      if (recognitionRef.current) {
+        recognitionRef.current.onresult = null;
+        recognitionRef.current.onerror = null;
+        recognitionRef.current.onend = null;
+        recognitionRef.current.onstart = null;
+      }
+    };
   }, [lang]);
 
   // Handle Speech Toggle
@@ -107,6 +186,7 @@ export function App() {
     if (isRecording) {
       recognitionRef.current.stop();
       setIsRecording(false);
+      setInterimTranscript('');
     } else {
       try {
         recognitionRef.current.lang = lang === 'en' ? 'en-IN' : lang === 'hi' ? 'hi-IN' : 'mr-IN';
@@ -136,28 +216,90 @@ export function App() {
 
   // Geolocation trigger
   const handleGetLocation = () => {
+    setGpsError(null);
     if (!navigator.geolocation) {
-      alert(lang === 'mr' ? 'आपल्या ब्राउझरमध्ये जीपीएस सपोर्ट नाही.' : 'Geolocation not supported by browser.');
+      const msg =
+        lang === 'mr'
+          ? 'आपल्या ब्राउझरमध्ये जीपीएस / स्थान सेवा उपलब्ध नाही.'
+          : lang === 'hi'
+          ? 'आपके ब्राउज़र में जीपीएस स्थान सेवा समर्थित नहीं है।'
+          : 'Geolocation not supported by browser.';
+      setGpsError(msg);
+      alert(msg);
       return;
     }
+
+    setIsGpsLoading(true);
     navigator.geolocation.getCurrentPosition(
       async (pos) => {
+        setIsGpsLoading(false);
         const { latitude, longitude } = pos.coords;
         setCoords({ lat: latitude, lng: longitude });
-        const res = await resolveGeo(latitude, longitude);
-        setSelectedWardId(res.ward_id);
-        setAddress(res.address);
+        setGpsError(null);
+        try {
+          const res = await resolveGeo(latitude, longitude);
+          setSelectedWardId(res.ward_id);
+          setAddress(res.address);
+        } catch (err) {
+          console.error(err);
+        }
       },
-      () => {
-        alert(lang === 'mr' ? 'स्थान माहिती मिळवता आली नाही. कृपया प्रभाग निवडा.' : 'Could not fetch GPS. Please select ward.');
+      (err: GeolocationPositionError) => {
+        setIsGpsLoading(false);
+        let errorMsg = '';
+        if (err.code === err.PERMISSION_DENIED) {
+          errorMsg =
+            lang === 'mr'
+              ? 'स्थान (GPS) परवानगी नाकारली गेली. कृपया ब्राऊझर किंवा फोन सेटिंग्जमध्ये परवानगी द्या.'
+              : lang === 'hi'
+              ? 'स्थान (GPS) अनुमति अस्वीकृत कर दी गई। कृपया ब्राउज़र सेटिंग्स में अनुमति दें।'
+              : 'Location permission denied. Please allow location access in your browser settings.';
+        } else if (err.code === err.POSITION_UNAVAILABLE) {
+          errorMsg =
+            lang === 'mr'
+              ? 'स्थान माहिती उपलब्ध नाही. कृपया इंटरनेट किंवा जीपीएस तपासा.'
+              : lang === 'hi'
+              ? 'स्थान जानकारी उपलब्ध नहीं है। कृपया जीपीएस जांचें।'
+              : 'Location information is unavailable. Please check your GPS.';
+        } else if (err.code === err.TIMEOUT) {
+          errorMsg =
+            lang === 'mr'
+              ? 'जीपीएस स्थान मिळवताना वेळ संपला (Timeout). कृपया पुन्हा प्रयत्न करा.'
+              : lang === 'hi'
+              ? 'स्थान प्राप्त करने का समय समाप्त हो गया। कृपया पुनः प्रयास करें।'
+              : 'Location request timed out. Please try again.';
+        } else {
+          errorMsg =
+            lang === 'mr'
+              ? 'स्थान माहिती मिळवता आली नाही. कृपया प्रभाग निवडा.'
+              : lang === 'hi'
+              ? 'स्थान प्राप्त नहीं हो सका। कृपया वार्ड चुनें।'
+              : 'Could not fetch GPS. Please select ward manually.';
+        }
+        setGpsError(errorMsg);
+        alert(errorMsg);
       },
-      { timeout: 8000 }
+      { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
     );
+  };
+
+  // Handle map click or marker drag
+  const handleMapLocationChange = async (newCoords: { lat: number; lng: number }) => {
+    setCoords(newCoords);
+    setGpsError(null);
+    try {
+      const res = await resolveGeo(newCoords.lat, newCoords.lng);
+      setSelectedWardId(res.ward_id);
+      setAddress(res.address);
+    } catch (e) {
+      console.error(e);
+    }
   };
 
   // Handle Ward Selection Change
   const handleWardChange = (wardId: number) => {
     setSelectedWardId(wardId);
+    setGpsError(null);
     const ward = PUNE_WARDS.find(w => w.id === wardId);
     if (ward) {
       setCoords({ lat: ward.lat, lng: ward.lng });
@@ -183,6 +325,60 @@ export function App() {
     setFilteredSchemes(result);
   }, [schemeAge, schemeIncome]);
 
+  // Dedicated AI Classification & Department Recommendation Trigger
+  const handleClassify = async (overrideText?: string, overrideCategory?: ComplaintCategory) => {
+    const textToClassify = (overrideText !== undefined ? overrideText : transcript).trim();
+    if (!textToClassify) {
+      setClassifyError(
+        lang === 'mr'
+          ? 'कृपया आधी समस्येचे वर्णन लिहा किंवा मायक्रोफोनद्वारे बोला.'
+          : lang === 'hi'
+          ? 'कृपया पहले समस्या का विवरण लिखें या माइक से बोलें।'
+          : 'Please enter or speak your complaint description first.'
+      );
+      return;
+    }
+
+    setClassifyError(null);
+    setIsClassifying(true);
+    try {
+      const res = await classifyText(textToClassify, lang);
+      setClassificationResult(res);
+      setCategory(overrideCategory || res.category);
+      const initialChecked: Record<string, boolean> = {};
+      (res.required_documents || []).forEach(d => { initialChecked[d] = true; });
+      (res.optional_documents || []).forEach(d => { initialChecked[d] = false; });
+      setCheckedDocs(initialChecked);
+    } catch (err) {
+      console.error(err);
+      setClassifyError(
+        lang === 'mr'
+          ? 'AI वर्गीकरण करताना त्रुटी आली. कृपया पुन्हा प्रयत्न करा.'
+          : lang === 'hi'
+          ? 'AI वर्गीकरण में त्रुटि आई। कृपया पुनः प्रयास करें।'
+          : 'Failed to analyze complaint with AI. Please try again.'
+      );
+    } finally {
+      setIsClassifying(false);
+    }
+  };
+
+  const handlePhoneChange = (val: string) => {
+    const sanitized = sanitizeIndianMobileInput(val);
+    setCitizenPhone(sanitized);
+
+    // Requirement 7: Clear error immediately when a valid 10-digit number is entered
+    if (isValidIndianMobile(sanitized)) {
+      if (formErrors.phone) {
+        setFormErrors(prev => {
+          const next = { ...prev };
+          delete next.phone;
+          return next;
+        });
+      }
+    }
+  };
+
   // Form Validation & Submission
   const handleSubmitComplaint = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -194,8 +390,8 @@ export function App() {
     if (!citizenName.trim()) {
       errors.name = lang === 'mr' ? 'कृपया नागरिकाचे नाव प्रविष्ट करा.' : 'Please enter citizen name.';
     }
-    if (!citizenPhone.trim() || !/^[6-9]\d{9}$/.test(citizenPhone.trim())) {
-      errors.phone = lang === 'mr' ? 'कृपया वैध १०-अंकी भारतीय मोबाईल नंबर प्रविष्ट करा.' : 'Enter valid 10-digit Indian phone number.';
+    if (!isValidIndianMobile(citizenPhone)) {
+      errors.phone = getPhoneErrorMessage(lang);
     }
 
     if (Object.keys(errors).length > 0) {
@@ -207,7 +403,18 @@ export function App() {
 
     try {
       setSubmitStep(lang === 'mr' ? 'आवाज व समस्येचे AI विश्लेषण करत आहे...' : 'Analyzing issue with AI classification...');
-      const classification = await classifyText(transcript, lang);
+      let classification = classificationResult;
+      if (!classification || classification.category !== category) {
+        classification = await classifyText(transcript, lang);
+        setClassificationResult(classification);
+      }
+
+      const verifiedDocs = Object.keys(checkedDocs).filter(k => checkedDocs[k]);
+      const finalDocuments = verifiedDocs.length > 0
+        ? verifiedDocs
+        : (classification.required_documents && classification.required_documents.length > 0
+            ? classification.required_documents
+            : classification.documents);
 
       setSubmitStep(lang === 'mr' ? 'पुणे प्रभाग व संबंधित विभाग निश्चित करत आहे...' : 'Assigning PMC ward and department...');
       const ward = PUNE_WARDS.find(w => w.id === selectedWardId) || PUNE_WARDS[0];
@@ -215,7 +422,7 @@ export function App() {
       setSubmitStep(lang === 'mr' ? 'अधिकृत तक्रार अर्ज (Letterhead) तयार करत आहे...' : 'Formatting official municipal letter...');
 
       const complaintData: Partial<Complaint> = {
-        category: classification.category,
+        category: category || classification.category,
         department_key: classification.department_key,
         department_name: classification.department_name,
         lang,
@@ -233,7 +440,7 @@ export function App() {
         citizen_phone: citizenPhone,
         status: 'submitted',
         created_at: new Date().toISOString(),
-        documents: classification.documents
+        documents: finalDocuments
       };
 
       const result = await submitComplaint(complaintData);
@@ -250,10 +457,14 @@ export function App() {
       // Update ward stats locally
       setWardStats(prev => prev.map(w => {
         if (w.ward_id === ward.id) {
+          const currentSub = Number(w.by_status?.submitted || 0);
           return {
             ...w,
-            total: w.total + 1,
-            by_status: { ...w.by_status, submitted: w.by_status.submitted + 1 }
+            total: Number(w.total || 0) + 1,
+            by_status: {
+              ...w.by_status,
+              submitted: currentSub + 1
+            }
           };
         }
         return w;
@@ -310,7 +521,13 @@ export function App() {
   };
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', minHeight: '100vh', background: 'var(--page-bg)' }}>
+    <div style={{ display: 'flex', flexDirection: 'column', minHeight: '100vh', background: 'var(--page-bg)', position: 'relative' }}>
+      {/* Sparkle Cursor Particle System (Normal pointer preserved, no idle particles, click burst) */}
+      <SparkleCursor />
+
+      {/* Atmospheric Misty Pune / Soft Fog Background Environment */}
+      <MistyPuneBackground />
+
       {/* Top Municipal Notification Bar */}
       <div className="no-print" style={{ background: 'var(--primary-forest)', color: 'var(--warm-beige)', padding: '0.45rem 1rem', fontSize: '0.8125rem', borderBottom: '1px solid var(--primary-hover)' }}>
         <div className="civic-container" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.5rem' }}>
@@ -483,14 +700,16 @@ export function App() {
           <section className="no-print" style={{
             position: 'relative',
             overflow: 'hidden',
-            background: 'linear-gradient(145deg, #FFFFFF, var(--warm-beige-light))',
+            background: 'linear-gradient(145deg, rgba(255, 255, 255, 0.96), rgba(247, 243, 231, 0.92))',
+            backdropFilter: 'blur(10px)',
+            WebkitBackdropFilter: 'blur(10px)',
             border: '1px solid var(--border-color)',
             borderRadius: 'var(--radius-xl)',
             padding: '2rem 1.75rem',
             marginBottom: '2rem',
             boxShadow: 'var(--shadow-sm)'
           }}>
-            {/* React Bits Subtle Ambient Civic Canvas */}
+            {/* Ambient Misty Pune Heritage Canvas */}
             <HeroBackground />
 
             <div style={{ position: 'relative', zIndex: 1, display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '1.5rem' }}>
@@ -660,86 +879,102 @@ export function App() {
                           {speechError}
                         </div>
                       )}
+                      {interimTranscript && (
+                        <div style={{ marginTop: '1rem', fontStyle: 'italic', color: 'var(--primary-forest)', fontWeight: 500, fontSize: '0.9rem', padding: '0.5rem', background: '#fff', borderRadius: '4px' }}>
+                          {interimTranscript}
+                        </div>
+                      )}
                     </div>
 
                     {/* Quick Sample Buttons */}
                     <div style={{ marginBottom: '1.25rem' }}>
                       <div style={{ fontSize: '0.8125rem', fontWeight: 600, color: 'var(--text-secondary)', marginBottom: '0.4rem' }}>
-                        {lang === 'mr' ? 'उदाहरणे (क्लिक करा):' : 'Sample Prompts:'}
+                        {lang === 'mr' ? 'उदाहरणे (क्लिक करा व त्वरित AI शिफारस पहा):' : lang === 'hi' ? 'उदाहरण (क्लिक कर तुरंत AI विश्लेषण देखें):' : 'Sample Prompts (Click for Instant AI Recommendation):'}
                       </div>
-                      <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem' }}>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setTranscript('माझ्या घराजवळ फर्ग्युसन कॉलेज रस्त्यावर मोठा खड्डा पडला आहे, काल रात्री दुचाकी घसरून अपघात झाला.');
-                            setCategory('pothole');
-                          }}
-                          style={{
-                            background: '#FFFFFF',
-                            border: '1px solid var(--border-color)',
-                            borderRadius: 'var(--radius-sm)',
-                            padding: '0.45rem 0.75rem',
-                            textAlign: 'left',
-                            fontSize: '0.8125rem',
-                            cursor: 'pointer',
-                            color: 'var(--text-main)',
-                            transition: 'all 0.15s ease'
-                          }}
-                        >
-                          🕳️ "एफसी रोडवर मोठा खड्डा पडला आहे, अपघात होत आहेत..."
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setTranscript('कोथरूड डीपी रस्त्यावरील कचराकुंडी गेल्या तीन दिवसांपासून साफ केलेली नाही, रस्त्यावर घाण पसरली आहे.');
-                            setCategory('garbage');
-                          }}
-                          style={{
-                            background: '#FFFFFF',
-                            border: '1px solid var(--border-color)',
-                            borderRadius: 'var(--radius-sm)',
-                            padding: '0.45rem 0.75rem',
-                            textAlign: 'left',
-                            fontSize: '0.8125rem',
-                            cursor: 'pointer',
-                            color: 'var(--text-main)',
-                            transition: 'all 0.15s ease'
-                          }}
-                        >
-                          🗑️ "कचराकुंडी भरून वाहते आहे, दुर्गंधी सुटली आहे..."
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setTranscript('माझ्या शिधापत्रिका (रेशन कार्ड) मध्ये नवीन कुटुंब सदस्याचे नाव जोडायचे आहे, आवश्यक कागदपत्रांची माहिती द्या.');
-                            setCategory('ration_card');
-                          }}
-                          style={{
-                            background: '#FFFFFF',
-                            border: '1px solid var(--border-color)',
-                            borderRadius: 'var(--radius-sm)',
-                            padding: '0.45rem 0.75rem',
-                            textAlign: 'left',
-                            fontSize: '0.8125rem',
-                            cursor: 'pointer',
-                            color: 'var(--text-main)',
-                            transition: 'all 0.15s ease'
-                          }}
-                        >
-                          📑 "रेशन कार्डमध्ये मुलाचे नाव समाविष्ट करायचे आहे..."
-                        </button>
+                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: '0.35rem' }}>
+                        {[
+                          {
+                            icon: '🕳️',
+                            text: 'माझ्या घराजवळ फर्ग्युसन कॉलेज रस्त्यावर मोठा खड्डा पडला आहे, काल रात्री दुचाकी घसरून अपघात झाला.',
+                            label: lang === 'mr' ? 'खड्डा: "एफसी रोडवर मोठा खड्डा पडला आहे..."' : lang === 'hi' ? 'सड़क गड्ढा: "सड़क पर गहरा गड्ढा है..."' : 'Pothole: "Deep hazardous pothole on road..."',
+                            cat: 'pothole' as ComplaintCategory
+                          },
+                          {
+                            icon: '🗑️',
+                            text: 'कोथरूड डीपी रस्त्यावरील कचराकुंडी गेल्या तीन दिवसांपासून साफ केलेली नाही, रस्त्यावर दुर्गंधी सुटली आहे.',
+                            label: lang === 'mr' ? 'कचरा: "कचराकुंडी भरून वाहते आहे, दुर्गंधी..."' : lang === 'hi' ? 'कचरा: "कचरा पात्र भर गया है, बदबू आ रही है..."' : 'Garbage: "Overflowing municipal waste bin..."',
+                            cat: 'garbage' as ComplaintCategory
+                          },
+                          {
+                            icon: '💧',
+                            text: 'आमच्या भागात गेल्या दोन दिवसांपासून मुख्य पाईपलाईन फुटल्याने पिण्याच्या पाण्याची मोठी गळती होत आहे.',
+                            label: lang === 'mr' ? 'पाणीपुरवठा: "मुख्य पाईपलाईन फुटून पाण्याची गळती..."' : lang === 'hi' ? 'जल आपूर्ति: "पाइपलाइन फटने से भारी लीकेज..."' : 'Water: "Major pipeline burst & water leakage..."',
+                            cat: 'water' as ComplaintCategory
+                          },
+                          {
+                            icon: '💡',
+                            text: 'बाणेर रस्त्यावरील पथदिवे बंद आहेत, रात्री संपूर्ण रस्त्यावर अंधार असतो व विजेचा पोल क्र. १४ नादुरुस्त आहे.',
+                            label: lang === 'mr' ? 'पथदिवे: "बाणेर रस्त्यावरील पथदिवे बंद, अंधार..."' : lang === 'hi' ? 'स्ट्रीटलाइट: "सड़क की स्ट्रीटलाइट बंद है..."' : 'Streetlight: "Streetlights non-functional on road..."',
+                            cat: 'streetlight' as ComplaintCategory
+                          },
+                          {
+                            icon: '🚰',
+                            text: 'वारजे माळवाडी येथे चेंबर तुंबून सांडपाणी रस्त्यावर वाहत आहे, दुर्गंधीमुळे साथीचे रोग पसरण्याचा धोका आहे.',
+                            label: lang === 'mr' ? 'ड्रेनेज: "चेंबर तुंबून सांडपाणी रस्त्यावर वाहत आहे..."' : lang === 'hi' ? 'सीवेज: "सीवर चेंबर ओवरफ्लो होकर गंदा पानी बह रहा है..."' : 'Drainage: "Chamber choked & sewage overflowing..."',
+                            cat: 'drainage' as ComplaintCategory
+                          },
+                          {
+                            icon: '📑',
+                            text: 'माझ्या शिधापत्रिका (रेशन कार्ड) मध्ये नवीन कुटुंब सदस्याचे नाव जोडायचे आहे, आवश्यक कागदपत्रांची माहिती द्या.',
+                            label: lang === 'mr' ? 'रेशन कार्ड: "रेशन कार्डमध्ये मुलाचे नाव समाविष्ट..."' : lang === 'hi' ? 'राशन कार्ड: "राशन कार्ड में सदस्य का नाम जोड़ना है..."' : 'Ration Card: "Add member to existing ration card..."',
+                            cat: 'ration_card' as ComplaintCategory
+                          },
+                          {
+                            icon: '❓',
+                            text: 'मला पालिकेकडे एक तक्रार करायची आहे पण नक्की काय करावे समजत नाही.',
+                            label: lang === 'mr' ? 'अस्पष्ट: "तक्रार करायची आहे..." (Clarifying Question)' : lang === 'hi' ? 'अस्पष्ट: "शिकायत दर्ज करनी है..." (Clarifying Question)' : 'Unclear: "I need help with civic issue..." (Clarifying Question)',
+                            cat: 'other' as ComplaintCategory
+                          }
+                        ].map((s, idx) => (
+                          <button
+                            key={idx}
+                            type="button"
+                            onClick={() => {
+                              setTranscript(s.text);
+                              setCategory(s.cat);
+                              handleClassify(s.text, s.cat);
+                            }}
+                            style={{
+                              background: '#FFFFFF',
+                              border: '1px solid var(--border-color)',
+                              borderRadius: 'var(--radius-sm)',
+                              padding: '0.45rem 0.65rem',
+                              textAlign: 'left',
+                              fontSize: '0.8rem',
+                              cursor: 'pointer',
+                              color: 'var(--text-main)',
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: '0.35rem',
+                              transition: 'all 0.15s ease'
+                            }}
+                          >
+                            <span>{s.icon}</span>
+                            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{s.label}</span>
+                          </button>
+                        ))}
                       </div>
                     </div>
 
                     {/* Textarea for editable transcript */}
                     <div style={{ marginBottom: '1.25rem' }}>
                       <label style={{ display: 'block', fontWeight: 600, fontSize: '0.875rem', marginBottom: '0.35rem', color: 'var(--text-main)' }}>
-                        {lang === 'mr' ? 'तक्रारीचा मजकूर (तपासा / दुरुस्त करा) *' : 'Complaint Transcript (Review / Edit) *'}
+                        {lang === 'mr' ? 'तक्रारीचा मजकूर (तपासा / दुरुस्त करा) *' : lang === 'hi' ? 'शिकायत का विवरण (समीक्षा / संपादन करें) *' : 'Complaint Transcript (Review / Edit) *'}
                       </label>
                       <textarea
                         value={transcript}
                         onChange={(e) => setTranscript(e.target.value)}
-                        placeholder={lang === 'mr' ? 'उदा. माझ्या परिसरातील रस्त्यावर कचरा साचला आहे...' : 'Describe the civic issue here...'}
+                        placeholder={lang === 'mr' ? 'उदा. माझ्या परिसरातील रस्त्यावर कचरा साचला आहे...' : lang === 'hi' ? 'उदा. मेरे इलाके की सड़क पर कचरा जमा है...' : 'Describe the civic issue here...'}
                         rows={4}
                         style={{
                           width: '100%',
@@ -756,47 +991,395 @@ export function App() {
                           {formErrors.transcript}
                         </span>
                       )}
+
+                      {/* AI Analyze / Classify Button Row */}
+                      <div style={{ display: 'flex', gap: '0.75rem', marginTop: '0.75rem', alignItems: 'center', flexWrap: 'wrap' }}>
+                        <button
+                          type="button"
+                          onClick={() => handleClassify()}
+                          disabled={isClassifying}
+                          className="btn-saffron"
+                          style={{
+                            padding: '0.65rem 1.25rem',
+                            fontSize: '0.9rem',
+                            fontWeight: 700,
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            gap: '0.45rem',
+                            cursor: isClassifying ? 'wait' : 'pointer',
+                            boxShadow: 'var(--shadow-sm)'
+                          }}
+                        >
+                          <span className="material-symbols-outlined" style={{ fontSize: '20px' }}>
+                            {isClassifying ? 'sync' : 'psychology'}
+                          </span>
+                          <span>
+                            {isClassifying
+                              ? (lang === 'mr' ? 'AI वर्गीकरण सुरू आहे...' : lang === 'hi' ? 'AI वर्गीकरण जारी...' : 'Analyzing with AI...')
+                              : (lang === 'mr' ? 'AI विश्लेषण करा (विभाग व कागदपत्रे)' : lang === 'hi' ? 'AI विश्लेषण करें (विभाग व दस्तावेज)' : 'Classify & Analyze with AI')}
+                          </span>
+                        </button>
+
+                        {classificationResult && (
+                          <span style={{ fontSize: '0.8125rem', color: 'var(--success)', fontWeight: 600, display: 'inline-flex', alignItems: 'center', gap: '0.25rem' }}>
+                            <span className="material-symbols-outlined" style={{ fontSize: '18px' }}>check_circle</span>
+                            {lang === 'mr' ? 'AI विश्लेषण पूर्ण' : lang === 'hi' ? 'AI विश्लेषण संपन्न' : 'Classified'}
+                          </span>
+                        )}
+                      </div>
+
+                      {/* Classification Error Alert */}
+                      {classifyError && (
+                        <div style={{
+                          marginTop: '0.75rem',
+                          padding: '0.65rem 0.85rem',
+                          background: 'var(--danger-bg)',
+                          border: '1px solid var(--danger)',
+                          borderRadius: 'var(--radius-md)',
+                          color: 'var(--danger)',
+                          fontSize: '0.8125rem',
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: '0.5rem'
+                        }}>
+                          <span className="material-symbols-outlined" style={{ fontSize: '18px' }}>error</span>
+                          <span>{classifyError}</span>
+                        </div>
+                      )}
+
+                      {/* Loading Animation */}
+                      {isClassifying && (
+                        <div style={{
+                          marginTop: '1rem',
+                          padding: '1.25rem',
+                          background: 'var(--warm-beige-light)',
+                          border: '1.5px dashed var(--primary-forest)',
+                          borderRadius: 'var(--radius-lg)',
+                          textAlign: 'center'
+                        }}>
+                          <span className="material-symbols-outlined" style={{ fontSize: '28px', color: 'var(--primary-forest)' }}>
+                            sync
+                          </span>
+                          <div style={{ fontWeight: 700, color: 'var(--primary-forest)', marginTop: '0.5rem', fontSize: '0.95rem' }}>
+                            {lang === 'mr' ? 'AI समस्येचे विश्लेषण व योग्य विभाग शोधत आहे...' : lang === 'hi' ? 'AI समस्या का विश्लेषण और उचित विभाग खोज रहा है...' : 'AI analyzing issue and identifying municipal department...'}
+                          </div>
+                          <div style={{ fontSize: '0.8125rem', color: 'var(--text-secondary)', marginTop: '0.25rem' }}>
+                            {lang === 'mr' ? 'कागदपत्रे यादी व पुढील कार्यपद्धती तयार होत आहे' : lang === 'hi' ? 'दस्तावेज चेकलिस्ट व अगले कदम तैयार हो रहे हैं' : 'Preparing required documents checklist and next steps'}
+                          </div>
+                        </div>
+                      )}
                     </div>
 
                     {/* Category Selector */}
                     <div style={{ marginBottom: '1.25rem' }}>
                       <label style={{ display: 'block', fontWeight: 600, fontSize: '0.875rem', marginBottom: '0.35rem', color: 'var(--text-main)' }}>
-                        {lang === 'mr' ? 'समस्या प्रकार (Category)' : 'Issue Category'}
+                        {lang === 'mr' ? 'समस्या प्रकार (Category)' : lang === 'hi' ? 'शिकायत श्रेणी (Category)' : 'Issue Category'}
                       </label>
-                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '0.5rem' }}>
+                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(105px, 1fr))', gap: '0.45rem' }}>
                         {[
-                          { key: 'pothole', icon: '🕳️', mr: 'खड्डा', en: 'Pothole' },
-                          { key: 'garbage', icon: '🗑️', mr: 'कचरा', en: 'Garbage' },
-                          { key: 'ration_card', icon: '📑', mr: 'रेशन कार्ड', en: 'Ration' }
+                          { key: 'pothole', icon: '🕳️', mr: 'खड्डा', hi: 'सड़क गड्ढा', en: 'Pothole' },
+                          { key: 'garbage', icon: '🗑️', mr: 'कचरा', hi: 'कचरा', en: 'Garbage' },
+                          { key: 'water', icon: '💧', mr: 'पाणीपुरवठा', hi: 'जल आपूर्ति', en: 'Water' },
+                          { key: 'streetlight', icon: '💡', mr: 'पथदिवे', hi: 'स्ट्रीटलाइट', en: 'Streetlight' },
+                          { key: 'drainage', icon: '🚰', mr: 'ड्रेनेज', hi: 'सीवेज', en: 'Drainage' },
+                          { key: 'ration_card', icon: '📑', mr: 'रेशन कार्ड', hi: 'राशन कार्ड', en: 'Ration' },
+                          { key: 'other', icon: '❓', mr: 'इतर', hi: 'अन्य', en: 'Other' }
                         ].map(c => (
                           <SpotlightCard
                             key={c.key}
                             as="button"
                             type="button"
-                            onClick={() => setCategory(c.key as ComplaintCategory)}
+                            onClick={() => {
+                              const newCat = c.key as ComplaintCategory;
+                              setCategory(newCat);
+                              if (transcript.trim()) {
+                                handleClassify(transcript, newCat);
+                              }
+                            }}
                             spotlightColor={category === c.key ? 'rgba(52, 79, 31, 0.22)' : 'rgba(244, 153, 26, 0.22)'}
                             style={{
                               border: category === c.key ? '2px solid var(--primary-forest)' : '1px solid var(--border-color)',
                               background: category === c.key ? 'var(--warm-beige)' : '#FFFFFF',
                               color: category === c.key ? 'var(--primary-forest)' : 'var(--text-secondary)',
-                              padding: '0.65rem 0.5rem',
+                              padding: '0.55rem 0.35rem',
                               borderRadius: 'var(--radius-md)',
                               fontWeight: category === c.key ? 700 : 500,
                               cursor: 'pointer',
                               display: 'flex',
                               flexDirection: 'column',
                               alignItems: 'center',
-                              gap: '0.2rem',
-                              fontSize: '0.875rem',
+                              gap: '0.15rem',
+                              fontSize: '0.8125rem',
                               transition: 'all 0.15s ease'
                             }}
                           >
-                            <span style={{ fontSize: '1.25rem', marginBottom: '0.15rem' }}>{c.icon}</span>
-                            <span>{lang === 'mr' ? c.mr : c.en}</span>
+                            <span style={{ fontSize: '1.2rem', marginBottom: '0.1rem' }}>{c.icon}</span>
+                            <span style={{ textAlign: 'center', lineHeight: 1.2 }}>{lang === 'hi' ? c.hi : lang === 'en' ? c.en : c.mr}</span>
                           </SpotlightCard>
                         ))}
                       </div>
                     </div>
+
+                    {/* ================= DEPARTMENT RECOMMENDATION & REQUIRED DOCUMENTS CARD ================= */}
+                    {classificationResult && !isClassifying && (
+                      <div style={{
+                        marginBottom: '1.5rem',
+                        background: '#FFFFFF',
+                        border: '1.5px solid var(--primary-forest)',
+                        borderRadius: 'var(--radius-lg)',
+                        padding: '1.35rem',
+                        boxShadow: 'var(--shadow-sm)'
+                      }}>
+                        {/* Header: Category Badge + Priority + Confidence */}
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.5rem', borderBottom: '1px solid var(--border-color)', paddingBottom: '0.75rem', marginBottom: '1rem' }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                            <span style={{ fontSize: '1.5rem' }}>
+                              {classificationResult.category === 'pothole' ? '🕳️' :
+                               classificationResult.category === 'garbage' ? '🗑️' :
+                               classificationResult.category === 'water' ? '💧' :
+                               classificationResult.category === 'streetlight' ? '💡' :
+                               classificationResult.category === 'drainage' ? '🚰' :
+                               classificationResult.category === 'ration_card' ? '📑' : '❓'}
+                            </span>
+                            <div>
+                              <div style={{ fontSize: '0.75rem', textTransform: 'uppercase', letterSpacing: '0.05em', color: 'var(--text-secondary)', fontWeight: 700 }}>
+                                {lang === 'mr' ? 'AI शिफारस श्रेणी' : lang === 'hi' ? 'AI श्रेणी' : 'AI Category'}
+                              </div>
+                              <div style={{ fontWeight: 800, fontSize: '1.05rem', color: 'var(--primary-forest)' }}>
+                                {classificationResult.category === 'pothole' ? (lang === 'mr' ? 'रस्त्यातील खड्डा / पथ देखभाल' : lang === 'hi' ? 'सड़क गड्ढा / रखरखाव' : 'Road Maintenance') :
+                                 classificationResult.category === 'garbage' ? (lang === 'mr' ? 'घनकचरा व्यवस्थापन' : lang === 'hi' ? 'ठोस अपशिष्ट प्रबंधन' : 'Solid Waste Management') :
+                                 classificationResult.category === 'water' ? (lang === 'mr' ? 'पाणी पुरवठा विभाग' : lang === 'hi' ? 'जल आपूर्ति विभाग' : 'Water Supply Department') :
+                                 classificationResult.category === 'streetlight' ? (lang === 'mr' ? 'विद्युत व पथदिवे विभाग' : lang === 'hi' ? 'विद्युत व स्ट्रीटलाइट' : 'Streetlight Department') :
+                                 classificationResult.category === 'drainage' ? (lang === 'mr' ? 'मलनिस्सारण व ड्रेनेज' : lang === 'hi' ? 'सीवेज व ड्रेनेज विभाग' : 'Drainage Department') :
+                                 classificationResult.category === 'ration_card' ? (lang === 'mr' ? 'अन्न व नागरी पुरवठा (शिधापत्रिका)' : lang === 'hi' ? 'खाद्य एवं नागरिक आपूर्ति' : 'Food & Civil Supplies') :
+                                 (lang === 'mr' ? 'सामान्य जनतक्रार निवारण' : lang === 'hi' ? 'सामान्य जनशिकायत' : 'General Grievance')}
+                              </div>
+                            </div>
+                          </div>
+
+                          <div style={{ display: 'flex', gap: '0.4rem', flexWrap: 'wrap' }}>
+                            <span className={`civic-badge ${classificationResult.priority === 'high' ? 'badge-saffron' : classificationResult.priority === 'medium' ? 'badge-forest' : 'badge-neutral'}`} style={{ fontSize: '0.75rem' }}>
+                              {lang === 'mr'
+                                ? (classificationResult.priority === 'high' ? '⚡ उच्च प्राधान्य (High)' : classificationResult.priority === 'medium' ? 'मध्यम प्राधान्य (Medium)' : 'कमी प्राधान्य (Low)')
+                                : lang === 'hi'
+                                ? (classificationResult.priority === 'high' ? '⚡ उच्च प्राथमिकता' : classificationResult.priority === 'medium' ? 'मध्यम प्राथमिकता' : 'कम प्राथमिकता')
+                                : `⚡ ${classificationResult.priority.toUpperCase()} Priority`}
+                            </span>
+                            <span className="civic-badge badge-forest" style={{ fontSize: '0.75rem' }}>
+                              {Math.round(classificationResult.confidence * 100)}% {lang === 'mr' ? 'AI अचूकता' : lang === 'hi' ? 'सटीकता' : 'Confidence'}
+                            </span>
+                          </div>
+                        </div>
+
+                        {/* Responsible Department & Explanation Box */}
+                        <div style={{
+                          background: 'var(--warm-beige-light)',
+                          border: '1px solid var(--border-color)',
+                          borderRadius: 'var(--radius-md)',
+                          padding: '0.9rem',
+                          marginBottom: '1rem'
+                        }}>
+                          <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', fontWeight: 600, display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
+                            <span className="material-symbols-outlined" style={{ fontSize: '18px', color: 'var(--primary-forest)' }}>account_balance</span>
+                            <span>{lang === 'mr' ? 'जबाबदार मनपा विभाग (Responsible Department):' : lang === 'hi' ? 'उत्तरदायी विभाग (Responsible Department):' : 'Responsible Municipal Department:'}</span>
+                          </div>
+                          <div style={{ fontSize: '1.15rem', fontWeight: 800, color: 'var(--primary-forest)', marginTop: '0.2rem' }}>
+                            {classificationResult.department_name}
+                          </div>
+
+                          {/* Reason / Explanation */}
+                          <div style={{
+                            marginTop: '0.6rem',
+                            padding: '0.6rem 0.75rem',
+                            background: '#FFFFFF',
+                            borderLeft: '3.5px solid var(--primary-forest)',
+                            borderRadius: 'var(--radius-sm)',
+                            fontSize: '0.875rem',
+                            color: 'var(--text-main)',
+                            lineHeight: 1.5
+                          }}>
+                            <strong>{lang === 'mr' ? '💡 हा विभाग का?' : lang === 'hi' ? '💡 यह विभाग क्यों?' : '💡 Why this department?'}</strong>{' '}
+                            {classificationResult.reason}
+                          </div>
+                        </div>
+
+                        {/* Clarifying Question Card (for unclear / general complaints) */}
+                        {classificationResult.clarifying_question && (
+                          <div style={{
+                            marginBottom: '1rem',
+                            padding: '0.85rem 1rem',
+                            background: '#FEF3C7',
+                            border: '1.5px solid #F59E0B',
+                            borderRadius: 'var(--radius-md)',
+                            color: '#92400E'
+                          }}>
+                            <div style={{ display: 'flex', alignItems: 'flex-start', gap: '0.5rem' }}>
+                              <span className="material-symbols-outlined" style={{ fontSize: '22px', color: '#D97706' }}>help</span>
+                              <div>
+                                <div style={{ fontWeight: 800, fontSize: '0.9rem' }}>
+                                  {lang === 'mr' ? '❓ स्पष्टीकरणात्मक प्रश्न (Clarifying Question):' : lang === 'hi' ? '❓ स्पष्टीकरण प्रश्न (Clarifying Question):' : '❓ Clarifying Question:'}
+                                </div>
+                                <p style={{ margin: '0.25rem 0 0.5rem', fontSize: '0.875rem', fontWeight: 600 }}>
+                                  {classificationResult.clarifying_question}
+                                </p>
+                                <p style={{ margin: 0, fontSize: '0.8rem', opacity: 0.9 }}>
+                                  {lang === 'mr'
+                                    ? '👉 कृपया वरील माहिती तक्रारीच्या मजकुरात जोडून पुन्हा "AI विश्लेषण करा" बटनावर क्लिक करा.'
+                                    : lang === 'hi'
+                                    ? '👉 कृपया यह जानकारी अपनी शिकायत में जोड़ें और पुनः "AI विश्लेषण करें" दबाएं।'
+                                    : '👉 Please add this info to your complaint above and click "Classify & Analyze" again.'}
+                                </p>
+                              </div>
+                            </div>
+                          </div>
+                        )}
+
+                        {/* Required Documents Checklist */}
+                        <div style={{ marginBottom: '1rem' }}>
+                          <div style={{ fontSize: '0.9rem', fontWeight: 700, color: 'var(--primary-forest)', marginBottom: '0.5rem', display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
+                            <span className="material-symbols-outlined" style={{ fontSize: '18px', color: 'var(--success)' }}>fact_check</span>
+                            <span>{lang === 'mr' ? 'आवश्यक कागदपत्रे व माहिती चेकलिस्ट:' : lang === 'hi' ? 'आवश्यक दस्तावेज चेकलिस्ट:' : 'Required Documents Checklist:'}</span>
+                          </div>
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem' }}>
+                            {classificationResult.required_documents.map((doc, idx) => (
+                              <label
+                                key={`req-${idx}`}
+                                style={{
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                  justifyContent: 'space-between',
+                                  padding: '0.45rem 0.65rem',
+                                  background: checkedDocs[doc] ? 'var(--warm-beige)' : '#FFFFFF',
+                                  border: '1px solid var(--border-color)',
+                                  borderRadius: 'var(--radius-sm)',
+                                  cursor: 'pointer',
+                                  fontSize: '0.85rem'
+                                }}
+                              >
+                                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                                  <input
+                                    type="checkbox"
+                                    checked={checkedDocs[doc] ?? true}
+                                    onChange={(e) => setCheckedDocs(prev => ({ ...prev, [doc]: e.target.checked }))}
+                                  />
+                                  <span style={{ fontWeight: 600, color: 'var(--text-main)' }}>{doc}</span>
+                                </div>
+                                <span className="civic-badge badge-forest" style={{ fontSize: '0.68rem', padding: '0.1rem 0.4rem' }}>
+                                  {lang === 'mr' ? 'आवश्यक (Required)' : lang === 'hi' ? 'आवश्यक' : 'Required'}
+                                </span>
+                              </label>
+                            ))}
+                          </div>
+                        </div>
+
+                        {/* Helpful / Optional Documents */}
+                        {classificationResult.optional_documents && classificationResult.optional_documents.length > 0 && (
+                          <div style={{ marginBottom: '1rem' }}>
+                            <div style={{ fontSize: '0.85rem', fontWeight: 700, color: 'var(--text-secondary)', marginBottom: '0.4rem', display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
+                              <span className="material-symbols-outlined" style={{ fontSize: '18px' }}>attachment</span>
+                              <span>{lang === 'mr' ? 'मदतगार / ऐच्छिक कागदपत्रे (Helpful / Optional):' : lang === 'hi' ? 'वैकल्पिक दस्तावेज (Helpful / Optional):' : 'Helpful / Optional Documents:'}</span>
+                            </div>
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem' }}>
+                              {classificationResult.optional_documents.map((doc, idx) => (
+                                <label
+                                  key={`opt-${idx}`}
+                                  style={{
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    justifyContent: 'space-between',
+                                    padding: '0.45rem 0.65rem',
+                                    background: '#FFFFFF',
+                                    border: '1px dashed var(--border-color)',
+                                    borderRadius: 'var(--radius-sm)',
+                                    cursor: 'pointer',
+                                    fontSize: '0.85rem'
+                                  }}
+                                >
+                                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                                    <input
+                                      type="checkbox"
+                                      checked={checkedDocs[doc] ?? false}
+                                      onChange={(e) => setCheckedDocs(prev => ({ ...prev, [doc]: e.target.checked }))}
+                                    />
+                                    <span style={{ color: 'var(--text-main)' }}>{doc}</span>
+                                  </div>
+                                  <span className="civic-badge badge-neutral" style={{ fontSize: '0.68rem', padding: '0.1rem 0.4rem' }}>
+                                    {lang === 'mr' ? 'ऐच्छिक (Optional)' : lang === 'hi' ? 'ऐच्छिक' : 'Optional'}
+                                  </span>
+                                </label>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+
+                        {/* Next Steps for Citizen */}
+                        {classificationResult.next_steps && classificationResult.next_steps.length > 0 && (
+                          <div style={{ marginBottom: '1rem' }}>
+                            <div style={{ fontSize: '0.875rem', fontWeight: 700, color: 'var(--primary-forest)', marginBottom: '0.45rem', display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
+                              <span className="material-symbols-outlined" style={{ fontSize: '18px', color: 'var(--primary-forest)' }}>arrow_forward</span>
+                              <span>{lang === 'mr' ? 'नागरिकांसाठी पुढील पायऱ्या (Next Steps):' : lang === 'hi' ? 'नागरिक के लिए अगले कदम (Next Steps):' : 'Next Steps for Citizen:'}</span>
+                            </div>
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem' }}>
+                              {classificationResult.next_steps.map((step, idx) => (
+                                <div
+                                  key={`step-${idx}`}
+                                  style={{
+                                    display: 'flex',
+                                    alignItems: 'flex-start',
+                                    gap: '0.5rem',
+                                    fontSize: '0.825rem',
+                                    color: 'var(--text-main)',
+                                    background: 'var(--warm-beige-light)',
+                                    padding: '0.4rem 0.6rem',
+                                    borderRadius: 'var(--radius-sm)'
+                                  }}
+                                >
+                                  <span style={{
+                                    background: 'var(--primary-forest)',
+                                    color: '#FFFFFF',
+                                    width: '18px',
+                                    height: '18px',
+                                    borderRadius: '50%',
+                                    display: 'inline-flex',
+                                    alignItems: 'center',
+                                    justifyContent: 'center',
+                                    fontSize: '0.7rem',
+                                    fontWeight: 800,
+                                    flexShrink: 0
+                                  }}>
+                                    {idx + 1}
+                                  </span>
+                                  <span style={{ lineHeight: 1.4 }}>{step}</span>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+
+                        {/* Non-submission disclaimer */}
+                        <div style={{
+                          fontSize: '0.78rem',
+                          color: 'var(--text-secondary)',
+                          padding: '0.5rem 0.65rem',
+                          background: 'var(--warm-beige)',
+                          borderRadius: 'var(--radius-sm)',
+                          border: '1px solid var(--border-color)',
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: '0.35rem'
+                        }}>
+                          <span className="material-symbols-outlined" style={{ fontSize: '16px', color: 'var(--saffron-accent)' }}>info</span>
+                          <span>
+                            <strong>{lang === 'mr' ? 'टीप:' : lang === 'hi' ? 'सूचना:' : 'Note:'}</strong>{' '}
+                            {lang === 'mr'
+                              ? 'हे AI द्वारे केलेले प्राथमिक वर्गीकरण आहे. तक्रार अद्याप अधिकृतपणे दाखल झालेली नाही. कृपया खालील फॉर्म तपासून अर्ज तयार करा.'
+                              : lang === 'hi'
+                              ? 'यह AI द्वारा किया गया प्राथमिक विश्लेषण है। शिकायत अभी दर्ज नहीं हुई है। कृपया नीचे दी गई जानकारी जांचें।'
+                              : 'This is preliminary AI guidance. The complaint is NOT officially submitted yet. Review details and generate official letter below.'}
+                          </span>
+                        </div>
+                      </div>
+                    )}
 
                     {/* Photo Upload with Preview */}
                     <div style={{ marginBottom: '1.5rem' }}>
@@ -864,20 +1447,25 @@ export function App() {
                           <button
                             type="button"
                             onClick={handleGetLocation}
+                            disabled={isGpsLoading}
                             style={{
                               background: 'transparent',
                               border: 'none',
-                              color: 'var(--primary-forest)',
+                              color: isGpsLoading ? 'var(--text-secondary)' : 'var(--primary-forest)',
                               fontSize: '0.8125rem',
                               fontWeight: 700,
                               display: 'inline-flex',
                               alignItems: 'center',
                               gap: '0.25rem',
-                              cursor: 'pointer'
+                              cursor: isGpsLoading ? 'wait' : 'pointer'
                             }}
                           >
                             <span className="material-symbols-outlined" style={{ fontSize: '16px' }}>my_location</span>
-                            <span>{lang === 'mr' ? 'जीपीएस स्थान वापरा' : 'Use GPS'}</span>
+                            <span>
+                              {isGpsLoading
+                                ? (lang === 'mr' ? 'स्थान शोधत आहे...' : lang === 'hi' ? 'स्थान खोज रहे हैं...' : 'Locating...')
+                                : (lang === 'mr' ? 'जीपीएस स्थान वापरा' : 'Use GPS')}
+                            </span>
                           </button>
                         </div>
                         <select
@@ -898,6 +1486,47 @@ export function App() {
                             </option>
                           ))}
                         </select>
+                      </div>
+
+                      {/* GPS Error Alert */}
+                      {gpsError && (
+                        <div style={{
+                          marginBottom: '1.25rem',
+                          padding: '0.65rem 0.85rem',
+                          background: 'var(--danger-bg)',
+                          border: '1px solid var(--danger)',
+                          borderRadius: 'var(--radius-md)',
+                          color: 'var(--danger)',
+                          fontSize: '0.8125rem',
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: '0.5rem'
+                        }}>
+                          <span className="material-symbols-outlined" style={{ fontSize: '18px' }}>error</span>
+                          <span style={{ flex: 1, fontWeight: 500 }}>{gpsError}</span>
+                          <button
+                            type="button"
+                            onClick={() => setGpsError(null)}
+                            style={{ background: 'none', border: 'none', color: 'var(--danger)', cursor: 'pointer', padding: 0 }}
+                          >
+                            <span className="material-symbols-outlined" style={{ fontSize: '16px' }}>close</span>
+                          </button>
+                        </div>
+                      )}
+
+                      {/* Interactive Leaflet Location Map */}
+                      <div style={{ marginBottom: '1.25rem' }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.35rem' }}>
+                          <label style={{ fontWeight: 600, fontSize: '0.875rem', color: 'var(--text-main)' }}>
+                            {lang === 'mr' ? 'नकाशावर अचूक स्थान निवडा (Interactive Map) *' : lang === 'hi' ? 'नक़्शे पर स्थान चुनें (Interactive Map) *' : 'Pinpoint Location on Map *'}
+                          </label>
+                        </div>
+                        <LocationMap
+                          coords={coords}
+                          onChangeCoords={handleMapLocationChange}
+                          lang={lang}
+                          address={address}
+                        />
                       </div>
 
                       {/* Address / Landmark */}
@@ -966,9 +1595,19 @@ export function App() {
                           </span>
                           <input
                             type="tel"
-                            maxLength={10}
+                            maxLength={15}
                             value={citizenPhone}
-                            onChange={(e) => setCitizenPhone(e.target.value.replace(/\D/g, ''))}
+                            onChange={(e) => handlePhoneChange(e.target.value)}
+                            onPaste={(e) => {
+                              e.preventDefault();
+                              const pasted = e.clipboardData.getData('text');
+                              handlePhoneChange(pasted);
+                            }}
+                            onBlur={() => {
+                              if (citizenPhone && !isValidIndianMobile(citizenPhone)) {
+                                setFormErrors(prev => ({ ...prev, phone: getPhoneErrorMessage(lang) }));
+                              }
+                            }}
                             placeholder="९८२२०१२३४५"
                             style={{
                               flex: 1,
@@ -1267,12 +1906,34 @@ export function App() {
                   </span>
                 </div>
 
-                {/* KPI Summary Tiles with React Bits CountUp */}
+                {/* Data Transparency & Source Disclaimer */}
+                <div style={{
+                  padding: '0.55rem 0.85rem',
+                  background: 'var(--warm-beige-light)',
+                  border: '1px solid var(--border-color)',
+                  borderRadius: 'var(--radius-sm)',
+                  marginBottom: '1rem',
+                  fontSize: '0.8125rem',
+                  color: 'var(--text-secondary)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '0.5rem'
+                }}>
+                  <span className="material-symbols-outlined" style={{ fontSize: '18px', color: 'var(--saffron-accent)' }}>info</span>
+                  <span>
+                    <strong>{lang === 'mr' ? 'माहिती स्रोत पारदर्शकता:' : 'Data Source Transparency:'}</strong>{' '}
+                    {lang === 'mr'
+                      ? 'येथे दर्शविलेली प्रभाग आकडेवारी प्रात्यक्षिक / नमुना (Sample Demo Data) प्रणालीसाठी आहे. अधिकृत मनपा लाइव्ह डेटाबेस पडताळणीशिवाय हे शासकीय रेकॉर्ड मानू नये.'
+                      : 'Ward statistics displayed are demo/sample simulation data. Not official PMC live records without verified government authorization.'}
+                  </span>
+                </div>
+
+                {/* KPI Summary Tiles with React Bits CountUp (Guaranteed Zero NaN) */}
                 <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '1rem' }}>
                   <div className="civic-card" style={{ padding: '1.25rem' }}>
                     <div style={{ fontSize: '0.8125rem', color: 'var(--text-secondary)', fontWeight: 600 }}>{lang === 'mr' ? 'एकूण नोंदवलेल्या तक्रारी' : 'Total Complaints'}</div>
                     <CountUp
-                      to={wardStats.reduce((acc, w) => acc + w.total, 0)}
+                      to={safeNum(wardStats.reduce((acc, w) => acc + safeNum(w.total), 0))}
                       duration={1.2}
                       style={{ fontSize: '2rem', fontWeight: 800, color: 'var(--primary-forest)', marginTop: '0.25rem', display: 'block' }}
                     />
@@ -1282,7 +1943,7 @@ export function App() {
                   <div className="civic-card" style={{ padding: '1.25rem' }}>
                     <div style={{ fontSize: '0.8125rem', color: 'var(--text-secondary)', fontWeight: 600 }}>{lang === 'mr' ? 'निवारण पूर्ण (Resolved)' : 'Resolved'}</div>
                     <CountUp
-                      to={wardStats.reduce((acc, w) => acc + w.by_status.resolved, 0)}
+                      to={safeNum(wardStats.reduce((acc, w) => acc + safeNum(w.by_status?.resolved), 0))}
                       duration={1.2}
                       style={{ fontSize: '2rem', fontWeight: 800, color: 'var(--success)', marginTop: '0.25rem', display: 'block' }}
                     />
@@ -1292,7 +1953,7 @@ export function App() {
                   <div className="civic-card" style={{ padding: '1.25rem' }}>
                     <div style={{ fontSize: '0.8125rem', color: 'var(--text-secondary)', fontWeight: 600 }}>{lang === 'mr' ? 'काम सुरू (In Progress)' : 'In Progress'}</div>
                     <CountUp
-                      to={wardStats.reduce((acc, w) => acc + w.by_status.in_progress, 0)}
+                      to={safeNum(wardStats.reduce((acc, w) => acc + safeNum(w.by_status?.in_progress), 0))}
                       duration={1.2}
                       style={{ fontSize: '2rem', fontWeight: 800, color: 'var(--info)', marginTop: '0.25rem', display: 'block' }}
                     />
@@ -1302,7 +1963,7 @@ export function App() {
                   <div className="civic-card" style={{ padding: '1.25rem' }}>
                     <div style={{ fontSize: '0.8125rem', color: 'var(--text-secondary)', fontWeight: 600 }}>{lang === 'mr' ? 'पडताळणी सुरू (In Review)' : 'Under Review'}</div>
                     <CountUp
-                      to={wardStats.reduce((acc, w) => acc + w.by_status.in_review, 0)}
+                      to={safeNum(wardStats.reduce((acc, w) => acc + safeNum(w.by_status?.in_review), 0))}
                       duration={1.2}
                       style={{ fontSize: '2rem', fontWeight: 800, color: 'var(--warning)', marginTop: '0.25rem', display: 'block' }}
                     />
@@ -1316,124 +1977,202 @@ export function App() {
                 <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(360px, 1fr))', gap: '1.5rem' }}>
                   {/* Pune Interactive SVG Ward Map */}
                   <div className="civic-card" style={{ padding: '1.5rem' }}>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem', flexWrap: 'wrap', gap: '0.5rem' }}>
                       <h3 style={{ fontSize: '1.15rem', color: 'var(--primary-forest)', display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
                         <span className="material-symbols-outlined" style={{ color: 'var(--primary-forest)' }}>hub</span>
                         {lang === 'mr' ? 'पुणे प्रभाग नकाशा (Pune Ward Centroids)' : 'Pune Ward Map'}
                       </h3>
-                      <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>क्लिक करून प्रभाग माहिती पहा</span>
-                    </div>
-
-                    {/* Styled SVG Civic Map Canvas */}
-                    <div style={{
-                      width: '100%',
-                      height: '340px',
-                      background: 'var(--warm-beige-light)',
-                      borderRadius: 'var(--radius-md)',
-                      border: '1px solid var(--border-color)',
-                      position: 'relative',
-                      overflow: 'hidden'
-                    }}>
-                      <svg viewBox="0 0 600 400" style={{ width: '100%', height: '100%' }}>
-                        {/* Stylized Mula-Mutha River representation */}
-                        <path
-                          d="M 50 160 Q 200 210, 320 180 T 580 150"
-                          fill="none"
-                          stroke="#BDD7EE"
-                          strokeWidth="18"
-                          strokeLinecap="round"
-                        />
-                        <path
-                          d="M 180 80 Q 260 140, 320 180"
-                          fill="none"
-                          stroke="#BDD7EE"
-                          strokeWidth="10"
-                          strokeLinecap="round"
-                        />
-
-                        {/* Ward centroid nodes using curated palette */}
-                        {[
-                          { id: 1, name: 'Shivajinagar', x: 280, y: 170, color: '#344F1F', total: 38 },
-                          { id: 2, name: 'Kasba Peth', x: 310, y: 210, color: '#F4991A', total: 29 },
-                          { id: 3, name: 'Aundh-Baner', x: 160, y: 110, color: '#344F1F', total: 44 },
-                          { id: 4, name: 'Kothrud', x: 190, y: 240, color: '#283D18', total: 51 },
-                          { id: 5, name: 'Hadapsar', x: 470, y: 230, color: '#F4991A', total: 42 },
-                          { id: 6, name: 'Yerawada', x: 420, y: 100, color: '#344F1F', total: 35 },
-                          { id: 7, name: 'Bibwewadi', x: 340, y: 310, color: '#283D18', total: 26 },
-                          { id: 8, name: 'Sinhagad Rd', x: 230, y: 320, color: '#F4991A', total: 33 },
-                          { id: 9, name: 'Warje', x: 150, y: 290, color: '#344F1F', total: 28 },
-                          { id: 10, name: 'Nagar Road', x: 460, y: 150, color: '#283D18', total: 31 }
-                        ].map(node => (
-                          <g
-                            key={node.id}
-                            style={{ cursor: 'pointer', transition: 'all 0.2s' }}
-                            onMouseEnter={() => setMapHoveredWard(`${node.name} (एकूण: ${node.total})`)}
-                            onMouseLeave={() => setMapHoveredWard(null)}
-                            onClick={() => setSelectedFilterWard(String(node.id))}
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                        {selectedFilterWard !== 'all' && (
+                          <button
+                            type="button"
+                            onClick={() => setSelectedFilterWard('all')}
+                            style={{
+                              background: 'var(--warm-beige)',
+                              border: '1px solid var(--border-color)',
+                              borderRadius: 'var(--radius-sm)',
+                              padding: '0.2rem 0.5rem',
+                              fontSize: '0.75rem',
+                              fontWeight: 600,
+                              color: 'var(--primary-forest)',
+                              cursor: 'pointer'
+                            }}
                           >
-                            <circle cx={node.x} cy={node.y} r="22" fill={node.color} opacity="0.22" />
-                            <circle cx={node.x} cy={node.y} r="12" fill={node.color} stroke="#FFFFFF" strokeWidth="2.5" />
-                            <text x={node.x} y={node.y + 26} fontSize="11" fontWeight="700" fill="var(--text-main)" textAnchor="middle">
-                              {node.name}
-                            </text>
-                          </g>
-                        ))}
-                      </svg>
-
-                      {/* Map Hover / Selected Info overlay */}
-                      <div style={{
-                        position: 'absolute',
-                        bottom: '12px',
-                        left: '12px',
-                        right: '12px',
-                        background: 'rgba(255, 255, 255, 0.95)',
-                        backdropFilter: 'blur(6px)',
-                        padding: '0.5rem 0.75rem',
-                        borderRadius: 'var(--radius-sm)',
-                        fontSize: '0.8125rem',
-                        display: 'flex',
-                        justifyContent: 'space-between',
-                        alignItems: 'center',
-                        border: '1px solid var(--border-color)'
-                      }}>
-                        <span style={{ fontWeight: 600, color: 'var(--primary-forest)' }}>
-                          📍 {mapHoveredWard || (lang === 'mr' ? 'प्रभागावर माउस फिरवून तक्रारींची संख्या पहा' : 'Hover over any ward node')}
-                        </span>
-                        <span style={{ color: 'var(--text-secondary)', fontSize: '0.75rem' }}>
-                          पुणे मनपा अधिकृत प्रभाग १ ते १०
+                            ✕ {lang === 'mr' ? 'फिल्टर काढा' : 'Clear Filter'}
+                          </button>
+                        )}
+                        <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>
+                          {lang === 'mr' ? 'प्रभागावर क्लिक करा' : 'Click/tap to select'}
                         </span>
                       </div>
                     </div>
+
+                    {/* Real Interactive Leaflet + OpenStreetMap Civic Ward Map */}
+                    <WardMap
+                      wardStats={wardStats}
+                      selectedFilterWard={selectedFilterWard}
+                      onSelectWard={handleSelectWard}
+                      lang={lang}
+                    />
                   </div>
 
-                  {/* Ward Breakdown Table */}
+                  {/* Functional Ward Statistics Table */}
                   <div className="civic-card" style={{ padding: '1.5rem', maxHeight: '420px', overflowY: 'auto' }}>
-                    <h3 style={{ fontSize: '1.15rem', color: 'var(--primary-forest)', marginBottom: '1rem', display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
-                      <span className="material-symbols-outlined" style={{ color: 'var(--primary-forest)' }}>table_chart</span>
-                      {lang === 'mr' ? 'प्रभागनिहाय आकडेवारी' : 'Ward Statistics Table'}
-                    </h3>
-
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
-                      {wardStats.map(w => {
-                        const resRate = Math.round((w.by_status.resolved / (w.total || 1)) * 100);
-                        return (
-                          <div key={w.ward_id} style={{ borderBottom: '1px solid var(--border-color)', paddingBottom: '0.5rem' }}>
-                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.25rem' }}>
-                              <span style={{ fontWeight: 600, fontSize: '0.875rem', color: 'var(--text-main)' }}>
-                                {w.name}
-                              </span>
-                              <span style={{ fontSize: '0.8125rem', color: 'var(--text-secondary)' }}>
-                                <strong>{w.total}</strong> तक्रारी ({resRate}% पूर्ण)
-                              </span>
-                            </div>
-                            {/* Progress bar */}
-                            <div style={{ width: '100%', height: '6px', background: 'var(--warm-beige)', borderRadius: '3px', overflow: 'hidden' }}>
-                              <div style={{ width: `${resRate}%`, height: '100%', background: 'var(--primary-forest)', borderRadius: '3px' }} />
-                            </div>
-                          </div>
-                        );
-                      })}
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem', flexWrap: 'wrap', gap: '0.5rem' }}>
+                      <h3 style={{ fontSize: '1.15rem', color: 'var(--primary-forest)', display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
+                        <span className="material-symbols-outlined" style={{ color: 'var(--primary-forest)' }}>table_chart</span>
+                        {lang === 'mr' ? 'प्रभागनिहाय आकडेवारी तक्ता' : 'Ward Statistics Table'}
+                      </h3>
+                      {selectedFilterWard !== 'all' && (
+                        <button
+                          type="button"
+                          onClick={() => setSelectedFilterWard('all')}
+                          style={{
+                            background: 'transparent',
+                            border: '1px solid var(--border-color)',
+                            borderRadius: 'var(--radius-sm)',
+                            padding: '0.25rem 0.5rem',
+                            fontSize: '0.75rem',
+                            color: 'var(--primary-forest)',
+                            cursor: 'pointer',
+                            fontWeight: 600
+                          }}
+                        >
+                          {lang === 'mr' ? 'सर्व प्रभाग दाखवा' : 'Show All Wards'}
+                        </button>
+                      )}
                     </div>
+
+                    {/* Loading State */}
+                    {isLoadingStats ? (
+                      <div style={{ textAlign: 'center', padding: '2.5rem 1rem', color: 'var(--text-secondary)' }}>
+                        <span className="material-symbols-outlined" style={{ fontSize: '32px', color: 'var(--primary-forest)' }}>
+                          sync
+                        </span>
+                        <div style={{ marginTop: '0.5rem', fontSize: '0.875rem' }}>
+                          {lang === 'mr' ? 'प्रभाग आकडेवारी लोड होत आहे...' : 'Loading ward statistics...'}
+                        </div>
+                      </div>
+                    ) : statsError ? (
+                      /* Error State */
+                      <div style={{
+                        padding: '1.25rem',
+                        background: 'var(--danger-bg)',
+                        border: '1px solid var(--danger)',
+                        borderRadius: 'var(--radius-md)',
+                        textAlign: 'center'
+                      }}>
+                        <div style={{ color: 'var(--danger)', fontSize: '0.875rem', fontWeight: 600 }}>{statsError}</div>
+                        <button
+                          type="button"
+                          onClick={loadDashboardStats}
+                          style={{
+                            marginTop: '0.75rem',
+                            background: 'var(--primary-forest)',
+                            color: '#FFFFFF',
+                            border: 'none',
+                            padding: '0.4rem 0.85rem',
+                            borderRadius: 'var(--radius-sm)',
+                            cursor: 'pointer',
+                            fontSize: '0.8125rem',
+                            fontWeight: 600
+                          }}
+                        >
+                          {lang === 'mr' ? 'पुन्हा प्रयत्न करा' : 'Retry'}
+                        </button>
+                      </div>
+                    ) : wardStats.length === 0 ? (
+                      /* Empty State */
+                      <div style={{ textAlign: 'center', padding: '2.5rem 1rem', color: 'var(--text-secondary)' }}>
+                        <span className="material-symbols-outlined" style={{ fontSize: '32px', color: 'var(--text-secondary)' }}>inbox</span>
+                        <div style={{ marginTop: '0.5rem', fontSize: '0.875rem' }}>
+                          {lang === 'mr' ? 'कोणतीही प्रभाग माहिती उपलब्ध नाही.' : 'No ward data available.'}
+                        </div>
+                      </div>
+                    ) : (
+                      /* Functional Table with all required fields */
+                      <div style={{ overflowX: 'auto' }}>
+                        <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '0.8125rem' }}>
+                          <thead>
+                            <tr style={{ background: 'var(--warm-beige-light)', borderBottom: '2px solid var(--border-color)', color: 'var(--text-main)' }}>
+                              <th style={{ padding: '0.6rem 0.5rem', fontWeight: 700 }}>{lang === 'mr' ? 'प्रभाग' : 'Ward'}</th>
+                              <th style={{ padding: '0.6rem 0.5rem', fontWeight: 700, textAlign: 'center' }}>{lang === 'mr' ? 'एकूण' : 'Total'}</th>
+                              <th style={{ padding: '0.6rem 0.5rem', fontWeight: 700, textAlign: 'center' }}>{lang === 'mr' ? 'पूर्ण' : 'Resolved'}</th>
+                              <th style={{ padding: '0.6rem 0.5rem', fontWeight: 700, textAlign: 'center' }}>{lang === 'mr' ? 'प्रलंबित' : 'Pending'}</th>
+                              <th style={{ padding: '0.6rem 0.5rem', fontWeight: 700, textAlign: 'center' }}>{lang === 'mr' ? 'निवारण %' : 'Rate'}</th>
+                              <th style={{ padding: '0.6rem 0.5rem', fontWeight: 700, textAlign: 'center' }}>{lang === 'mr' ? 'निवड' : 'Select'}</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {wardStats.map(w => {
+                              const total = safeNum(w.total);
+                              const resolved = safeNum(w.by_status?.resolved);
+                              const pending = Math.max(0, total - resolved);
+                              const resRate = total > 0 ? Math.min(100, Math.round((resolved / total) * 100)) : 0;
+                              const isSelected = selectedFilterWard === String(w.ward_id);
+
+                              return (
+                                <tr
+                                  key={w.ward_id}
+                                  onClick={() => handleSelectWard(w.ward_id)}
+                                  tabIndex={0}
+                                  role="button"
+                                  onKeyDown={(e) => {
+                                    if (e.key === 'Enter' || e.key === ' ') {
+                                      e.preventDefault();
+                                      handleSelectWard(w.ward_id);
+                                    }
+                                  }}
+                                  style={{
+                                    borderBottom: '1px solid var(--border-color)',
+                                    cursor: 'pointer',
+                                    background: isSelected ? 'var(--warm-beige)' : 'transparent',
+                                    transition: 'background 0.15s ease',
+                                    outline: 'none'
+                                  }}
+                                >
+                                  <td style={{ padding: '0.6rem 0.5rem', fontWeight: isSelected ? 700 : 600, color: 'var(--text-main)' }}>
+                                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem' }}>
+                                      {isSelected && <span style={{ color: 'var(--saffron-accent)', fontSize: '14px' }}>●</span>}
+                                      {w.name || `प्रभाग ${w.ward_id}`}
+                                    </span>
+                                  </td>
+                                  <td style={{ padding: '0.6rem 0.5rem', textAlign: 'center', fontWeight: 700, color: 'var(--primary-forest)' }}>
+                                    {total}
+                                  </td>
+                                  <td style={{ padding: '0.6rem 0.5rem', textAlign: 'center', color: 'var(--success)', fontWeight: 600 }}>
+                                    {resolved}
+                                  </td>
+                                  <td style={{ padding: '0.6rem 0.5rem', textAlign: 'center', color: 'var(--warning)', fontWeight: 600 }}>
+                                    {pending}
+                                  </td>
+                                  <td style={{ padding: '0.6rem 0.5rem', textAlign: 'center' }}>
+                                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', justifyContent: 'center' }}>
+                                      <div style={{ width: '40px', height: '5px', background: 'var(--border-color)', borderRadius: '3px', overflow: 'hidden' }}>
+                                        <div style={{ width: `${resRate}%`, height: '100%', background: 'var(--success)' }} />
+                                      </div>
+                                      <span style={{ fontSize: '0.75rem', fontWeight: 600 }}>{resRate}%</span>
+                                    </div>
+                                  </td>
+                                  <td style={{ padding: '0.6rem 0.5rem', textAlign: 'center' }}>
+                                    <span style={{
+                                      fontSize: '0.7rem',
+                                      padding: '0.2rem 0.45rem',
+                                      borderRadius: '4px',
+                                      background: isSelected ? 'var(--primary-forest)' : 'var(--warm-beige-light)',
+                                      color: isSelected ? '#FFFFFF' : 'var(--text-secondary)',
+                                      fontWeight: 600
+                                    }}>
+                                      {isSelected ? (lang === 'mr' ? 'निवडलेले ✓' : 'Selected ✓') : (lang === 'mr' ? 'पहा' : 'View')}
+                                    </span>
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
                   </div>
                 </div>
               </FadeContent>
@@ -1461,10 +2200,14 @@ export function App() {
                         onChange={(e) => setSelectedFilterCategory(e.target.value)}
                         style={{ padding: '0.35rem 0.65rem', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-color)', background: '#FFFFFF', color: 'var(--text-main)', fontSize: '0.8125rem' }}
                       >
-                        <option value="all">{lang === 'mr' ? 'सर्व समस्या प्रकार' : 'All Categories'}</option>
-                        <option value="pothole">{lang === 'mr' ? 'रस्त्यातील खड्डा' : 'Pothole'}</option>
-                        <option value="garbage">{lang === 'mr' ? 'कचरा' : 'Garbage'}</option>
-                        <option value="ration_card">{lang === 'mr' ? 'रेशन कार्ड' : 'Ration Card'}</option>
+                        <option value="all">{lang === 'mr' ? 'सर्व समस्या प्रकार' : lang === 'hi' ? 'सभी श्रेणियां' : 'All Categories'}</option>
+                        <option value="pothole">{lang === 'mr' ? 'रस्त्यातील खड्डा' : lang === 'hi' ? 'सड़क गड्ढा' : 'Pothole'}</option>
+                        <option value="garbage">{lang === 'mr' ? 'कचरा' : lang === 'hi' ? 'कचरा' : 'Garbage'}</option>
+                        <option value="water">{lang === 'mr' ? 'पाणीपुरवठा' : lang === 'hi' ? 'जल आपूर्ति' : 'Water Supply'}</option>
+                        <option value="streetlight">{lang === 'mr' ? 'पथदिवे' : lang === 'hi' ? 'स्ट्रीटलाइट' : 'Streetlight'}</option>
+                        <option value="drainage">{lang === 'mr' ? 'ड्रेनेज' : lang === 'hi' ? 'सीवेज' : 'Drainage'}</option>
+                        <option value="ration_card">{lang === 'mr' ? 'रेशन कार्ड' : lang === 'hi' ? 'राशन कार्ड' : 'Ration Card'}</option>
+                        <option value="other">{lang === 'mr' ? 'इतर तक्रार' : lang === 'hi' ? 'अन्य' : 'Other'}</option>
                       </select>
                     </div>
                   </div>
