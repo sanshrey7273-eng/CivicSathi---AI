@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import type { Language, ComplaintCategory, Complaint, WardStat, Scheme } from './types';
 import { PUNE_WARDS, GOV_SCHEMES, INITIAL_WARD_STATS } from './data/mockData';
-import { classifyText, resolveGeo, submitComplaint, fetchStats, fetchRecentComplaints, checkBackendHealth, type ClassifyResult } from './lib/api';
+import { classifyText, resolveGeo, submitComplaint, fetchStats, fetchRecentComplaints, checkBackendHealth, fetchComplaintByRef, API_BASE, type ClassifyResult } from './lib/api';
 import { BlurText } from './components/BlurText';
 import { SpotlightCard } from './components/SpotlightCard';
 import { CountUp } from './components/CountUp';
@@ -479,7 +479,7 @@ export function App() {
   };
 
   // Track status lookup
-  const handleTrackSearch = (e: React.FormEvent) => {
+  const handleTrackSearch = async (e: React.FormEvent) => {
     e.preventDefault();
     setTrackError(null);
     const query = trackQuery.trim();
@@ -493,10 +493,17 @@ export function App() {
     const found = recentComplaints.find(c => c.ref_no.toLowerCase() === query.toLowerCase());
     if (found) {
       setTrackedComplaint(found);
-    } else {
-      setTrackError(lang === 'mr' ? 'दिलेल्या क्रमांकाची तक्रार आढळली नाही. कृपया योग्य संदर्भ क्रमांक तपासा.' : 'Complaint reference number not found.');
-      setTrackedComplaint(null);
+      return;
     }
+
+    const remote = await fetchComplaintByRef(query);
+    if (remote) {
+      setTrackedComplaint(remote);
+      return;
+    }
+
+    setTrackError(lang === 'mr' ? 'दिलेल्या क्रमांकाची तक्रार आढळली नाही. कृपया योग्य संदर्भ क्रमांक तपासा.' : 'Complaint reference number not found.');
+    setTrackedComplaint(null);
   };
 
   // Copy Reference Number
@@ -1721,6 +1728,19 @@ export function App() {
                         <span className="material-symbols-outlined" style={{ fontSize: '20px' }}>print</span>
                         <span>{lang === 'mr' ? 'अर्ज प्रिंट / PDF जतन' : 'Print / Save PDF'}</span>
                       </button>
+
+                      {submittedComplaint.id && (
+                        <a
+                          href={`${API_BASE.replace(/\/api$/, '')}/api/documents/generate-pdf?id=${submittedComplaint.id}`}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="btn-outline"
+                          style={{ padding: '0.65rem 1.25rem', textDecoration: 'none' }}
+                        >
+                          <span className="material-symbols-outlined" style={{ fontSize: '20px' }}>download</span>
+                          <span>{lang === 'mr' ? 'PDF डाउनलोड' : 'Download PDF'}</span>
+                        </a>
+                      )}
 
                       <a
                         href={getWhatsAppShareUrl(submittedComplaint)}

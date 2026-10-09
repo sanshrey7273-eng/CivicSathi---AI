@@ -1,7 +1,16 @@
 import type { Complaint, Language, WardStat, ComplaintCategory } from '../types';
 import { DEPARTMENTS, INITIAL_COMPLAINTS, INITIAL_WARD_STATS, PUNE_WARDS } from '../data/mockData';
 
-const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000/api';
+const getApiBase = (): string => {
+  const envUrl = import.meta.env.VITE_API_BASE_URL;
+  if (envUrl && typeof envUrl === 'string' && envUrl.trim()) {
+    const clean = envUrl.trim().replace(/\/+$/, '');
+    return clean.endsWith('/api') ? clean : `${clean}/api`;
+  }
+  return import.meta.env.DEV ? 'http://localhost:8000/api' : '/api';
+};
+
+export const API_BASE = getApiBase();
 
 export interface ClassifyResult {
   category: ComplaintCategory;
@@ -350,6 +359,45 @@ export async function submitComplaint(data: Partial<Complaint>): Promise<{ id: s
     ref_no: refNo,
     pdf_url: null
   };
+}
+
+export async function fetchComplaintByRef(refNo: string): Promise<Complaint | null> {
+  try {
+    const clean = refNo.trim();
+    if (!clean) return null;
+    const res = await fetch(`${API_BASE}/complaints/${encodeURIComponent(clean)}`, {
+      signal: AbortSignal.timeout(6000)
+    });
+    if (res.ok) {
+      const data = await res.json();
+      return {
+        id: data.id || `c-${Date.now()}`,
+        ref_no: data.ref_no || clean,
+        category: data.category || 'other',
+        department_key: data.department_key || 'pmc_road',
+        department_name: data.department_name || 'PMC Department',
+        lang: data.lang || 'mr',
+        transcript: data.transcript || data.summary_local || '',
+        summary_local: data.summary_local || '',
+        summary_en: data.summary_en || '',
+        severity: data.severity || 'medium',
+        lat: data.lat || 18.5204,
+        lng: data.lng || 73.8567,
+        address: data.address || 'Pune',
+        ward_id: data.ward_id || 1,
+        ward_name: data.ward_name || 'Shivajinagar-Ghole Road',
+        image_url: data.image_url || null,
+        citizen_name: data.citizen_name || 'Citizen',
+        citizen_phone: data.citizen_phone || '',
+        status: data.status || 'submitted',
+        created_at: data.created_at || new Date().toISOString(),
+        documents: data.documents || []
+      };
+    }
+  } catch {
+    // Offline lookup
+  }
+  return null;
 }
 
 export async function fetchStats(): Promise<{ wards: WardStat[]; total: number; resolved: number; pending: number }> {
