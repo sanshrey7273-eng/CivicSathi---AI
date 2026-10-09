@@ -2,6 +2,7 @@ import os
 import re
 import random
 import datetime
+import uuid
 from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,6 +13,7 @@ from fastapi.responses import FileResponse
 from reportlab.pdfgen import canvas
 import tempfile
 import io
+import httpx
 from supabase import create_client, Client
 
 load_dotenv()
@@ -51,7 +53,7 @@ if GEMINI_API_KEY:
 
 # Supabase Configuration
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_ANON_KEY")
+SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_KEY") or os.environ.get("SUPABASE_ANON_KEY")
 supabase: Optional[Client] = None
 if SUPABASE_URL and SUPABASE_KEY:
     try:
@@ -535,32 +537,57 @@ async def resolve_geo(req: ResolveGeoRequest):
 async def create_complaint(complaint: ComplaintCreate):
     date_str = datetime.datetime.now().strftime("%Y%m%d")
     ref_no = f"NM-PUNE-{date_str}-{random.randint(1000, 9999)}"
-    comp_id = f"c-{int(datetime.datetime.now().timestamp() * 1000)}"
+    comp_id = str(uuid.uuid4())
+    now_iso = datetime.datetime.now().isoformat()
+    pdf_url = f"/api/documents/generate-pdf?id={comp_id}"
     
+    # Store complete complaint dictionary in-memory for immediate local retrieval
     comp_dict = {
         "id": comp_id,
         "ref_no": ref_no,
-        "status": "pending",
+        "status": complaint.status or "submitted",
         **complaint.dict(),
-        "created_at": datetime.datetime.now().isoformat()
+        "pdf_url": pdf_url,
+        "created_at": now_iso
     }
+    db_complaints[comp_id] = comp_dict
+
+    # Map category to allowed check constraint values ('pothole', 'garbage', 'ration_card', 'other')
+    valid_db_cats = {"pothole", "garbage", "ration_card", "other"}
+    db_cat = complaint.category if complaint.category in valid_db_cats else "other"
     
+    # Map status to valid enum ('submitted', 'in_review', 'in_progress', 'resolved', 'rejected')
+    valid_statuses = {"submitted", "in_review", "in_progress", "resolved", "rejected"}
+    db_status = complaint.status if complaint.status in valid_statuses else "submitted"
+    
+    # Prepare non-null required fields for Supabase table
+    transcript_val = complaint.transcript or complaint.summary_local or complaint.summary_en or "Civic Complaint"
+    lang_val = complaint.lang or "mr"
+    severity_val = complaint.severity or "medium"
+    address_val = complaint.address or "Pune, Maharashtra"
+    citizen_phone_val = complaint.citizen_phone or complaint.contact_phone
+    citizen_name_val = complaint.citizen_name or complaint.contact_name
+
     supabase_dict = {
         "id": comp_id,
         "ref_no": ref_no,
-        "category": complaint.category,
-        "department_key": complaint.department_key,
-        "department_name": complaint.department_name,
-        "summary_en": complaint.summary_en,
-        "summary_local": complaint.summary_local,
-        "lat": complaint.lat,
-        "lng": complaint.lng,
-        "address": complaint.address,
-        "ward_id": complaint.ward_id,
-        "ward_name": complaint.ward_name,
-        "status": "pending",
-        "is_anonymous": complaint.is_anonymous,
-        "created_at": comp_dict["created_at"]
+        "category": db_cat,
+        "department_key": complaint.department_key or "pmc_general",
+        "lang": lang_val,
+        "transcript": transcript_val,
+        "summary_en": complaint.summary_en or "Civic complaint registered",
+        "summary_local": complaint.summary_local or complaint.summary_en or "नागरी तक्रार",
+        "severity": severity_val,
+        "lat": float(complaint.lat),
+        "lng": float(complaint.lng),
+        "address": address_val,
+        "ward_id": int(complaint.ward_id or 1),
+        "image_url": complaint.image_url,
+        "pdf_url": pdf_url,
+        "citizen_name": citizen_name_val,
+        "citizen_phone": citizen_phone_val,
+        "status": db_status,
+        "created_at": now_iso
     }
 
     if supabase:
@@ -568,14 +595,12 @@ async def create_complaint(complaint: ComplaintCreate):
             supabase.table("complaints").insert(supabase_dict).execute()
         except Exception as e:
             print(f"Supabase insert error: {e}")
-            db_complaints[comp_id] = comp_dict
-    else:
-        db_complaints[comp_id] = comp_dict
-    
+
     return {
         "id": comp_id,
         "ref_no": ref_no,
-        "pdf_url": f"/api/documents/generate-pdf?id={comp_id}"
+        "status": db_status,
+        "pdf_url": pdf_url
     }
 
 @app.get("/api/complaints")
@@ -583,11 +608,15 @@ async def get_complaints():
     items = []
     if supabase:
         try:
-            res = supabase.table("complaints").select("*").order("created_at", desc=True).limit(50).execute()
+            res = supabase.table("public_complaints").select("*").order("created_at", desc=True).limit(50).execute()
             items = res.data or []
-        except Exception as e:
-            print(f"Supabase select error: {e}")
-            items = list(db_complaints.values())
+        except Exception:
+            try:
+                res = supabase.table("complaints").select("*").order("created_at", desc=True).limit(50).execute()
+                items = res.data or []
+            except Exception as e:
+                print(f"Supabase select error: {e}")
+                items = list(db_complaints.values())
     else:
         items = list(db_complaints.values())
 
@@ -667,7 +696,19 @@ async def track_complaint(ref_no: str):
         try:
             res = supabase.table("complaints").select("*").eq("ref_no", ref_no).execute()
             if res.data and len(res.data) > 0:
-                return res.data[0]
+                record = dict(res.data[0])
+                # Enrich department_name and ward_name if missing
+                if not record.get("department_name"):
+                    cat = record.get("category", "")
+                    meta = CIVIC_CATEGORY_METADATA.get(cat, {})
+                    record["department_name"] = meta.get("department_name", {}).get(record.get("lang", "en"), "PMC Civic Administration")
+                if not record.get("ward_name"):
+                    w_id = record.get("ward_id")
+                    for w in PUNE_OFFICIAL_WARDS:
+                        if w["id"] == w_id:
+                            record["ward_name"] = w["name"]
+                            break
+                return record
         except Exception as e:
             print(f"Supabase track error: {e}")
 
@@ -681,9 +722,14 @@ async def generate_pdf(id: str):
     comp = None
     if supabase:
         try:
+            # Query by UUID id or by ref_no
             res = supabase.table("complaints").select("*").eq("id", id).execute()
             if res.data and len(res.data) > 0:
-                comp = res.data[0]
+                comp = dict(res.data[0])
+            else:
+                res2 = supabase.table("complaints").select("*").eq("ref_no", id).execute()
+                if res2.data and len(res2.data) > 0:
+                    comp = dict(res2.data[0])
         except Exception as e:
             print(f"Supabase pdf fetch error: {e}")
 
@@ -691,19 +737,35 @@ async def generate_pdf(id: str):
         comp = db_complaints[id]
 
     if not comp:
+        # Check by ref_no in db_complaints
+        for c in db_complaints.values():
+            if c.get("ref_no") == id:
+                comp = c
+                break
+
+    if not comp:
         raise HTTPException(status_code=404, detail="Complaint not found")
+    
+    # Safe lookup for department name
+    dept_name = comp.get("department_name")
+    if not dept_name:
+        cat = comp.get("category", "")
+        dept_meta = CIVIC_CATEGORY_METADATA.get(cat, {})
+        dept_name = dept_meta.get("department_name", {}).get("en") or comp.get("department_key") or "PMC Civic Administration"
     
     # Generate actual PDF
     fd, temp_path = tempfile.mkstemp(suffix=".pdf")
     os.close(fd)
     
     c = canvas.Canvas(temp_path)
-    c.drawString(100, 800, f"Nagrik Mitra - Complaint Receipt")
+    c.drawString(100, 800, "Nagrik Mitra - Complaint Receipt")
     c.drawString(100, 780, f"Reference No: {comp.get('ref_no')}")
     c.drawString(100, 760, f"Date: {comp.get('created_at')}")
     c.drawString(100, 740, f"Category: {comp.get('category')}")
-    c.drawString(100, 720, f"Department: {comp.get('department_name')}")
-    c.drawString(100, 700, f"Summary: {comp.get('summary_en')}")
+    c.drawString(100, 720, f"Department: {dept_name}")
+    c.drawString(100, 700, f"Summary: {comp.get('summary_en') or comp.get('summary_local', '')}")
+    c.drawString(100, 680, f"Status: {comp.get('status', 'submitted').capitalize()}")
+    c.drawString(100, 660, f"Location: {comp.get('address', 'Pune')}")
     c.save()
     
     return FileResponse(temp_path, media_type="application/pdf", filename=f"Complaint_{comp.get('ref_no')}.pdf")
@@ -724,6 +786,23 @@ def check_eligibility():
 
 @app.get("/api/departments")
 def get_departments():
+    if supabase:
+        try:
+            res = supabase.table("departments").select("*").execute()
+            if res.data and len(res.data) > 0:
+                return [
+                    {
+                        "key": d.get("key"),
+                        "name": d.get("name_en") or d.get("name", ""),
+                        "name_mr": d.get("name_mr") or d.get("name", ""),
+                        "name_hi": d.get("name_hi") or d.get("name", ""),
+                        "category": d.get("category")
+                    }
+                    for d in res.data
+                ]
+        except Exception as e:
+            print(f"Supabase departments fetch error: {e}")
+
     return [
         {"key": meta["department_key"], "name": meta["department_name"]["en"], "name_mr": meta["department_name"]["mr"]}
         for meta in CIVIC_CATEGORY_METADATA.values()
